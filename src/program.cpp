@@ -11,8 +11,77 @@
 #include <program.h>
 #include <random>
 #include <stack>
+#include <omp.h>
 
 namespace genetic {
+
+constexpr int BLOCK_ROWS = 256;
+
+/**
+ * Per-thread arity buffer. grows to the longest program this thread has
+ * seen, never shrinks, never overflows. The pointer is valid until the
+ * next call on the same thread.
+ */
+inline const unsigned char *compute_arities(const node *nodes, int len) {
+  thread_local std::vector<unsigned char> buf;
+  if (buf.size() < static_cast<size_t>(len)) buf.resize(len);
+  for (int i = 0; i < len; ++i) {
+    const auto type = nodes[i].t;
+    buf[i] = detail::is_nonterminal(type)
+                 ? static_cast<unsigned char>(detail::arity(type))
+                 : 0;
+  }
+  return buf.data();
+}
+
+/**
+ * Evaluate one program on rows [r0, r0 + nb), node-major: each node is
+ * applied to the whole block before moving to the next node. Writes nb
+ * predictions to out. Serial; callers decide how to parallelize.
+ */
+template <int MaxSize = MAX_STACK_SIZE, int B = BLOCK_ROWS>
+inline void eval_block(const program_t prog, const float *data,
+                       const uint64_t n_rows, const uint64_t r0, const int nb,
+                       float *out) {
+  const node *nodes = prog->nodes;
+  const int len = prog->len;
+  const unsigned char *arities = compute_arities(nodes, len);
+
+  float stack[MaxSize][B];  // MaxSize * B floats, about 20 KB at 20 x 256
+  int top = 0;
+  float in[2] = {0.0f, 0.0f};
+
+  for (int i = len - 1; i >= 0; --i) {
+    const node &nd = nodes[i];
+    const unsigned char ar = arities[i];
+
+    if (ar == 0) {
+      // terminal: push a new row-vector
+      float *dst = stack[top];
+      for (int j = 0; j < nb; ++j)
+        dst[j] = detail::evaluate_node(nd, data, n_rows, r0 + j, in);
+      ++top;
+    } else if (ar == 1) {
+      // unary: overwrite top in place
+      float *x = stack[top - 1];
+      for (int j = 0; j < nb; ++j) {
+        in[0] = x[j];
+        x[j] = detail::evaluate_node(nd, data, n_rows, r0 + j, in);
+      }
+    } else {
+      // binary: in[0] = top, in[1] = second; result replaces second
+      float *a0 = stack[top - 1];
+      float *a1 = stack[top - 2];
+      for (int j = 0; j < nb; ++j) {
+        in[0] = a0[j];
+        in[1] = a1[j];
+        a1[j] = detail::evaluate_node(nd, data, n_rows, r0 + j, in);
+      }
+      --top;
+    }
+  }
+  std::copy(stack[0], stack[0] + nb, out);
+}
 
 /**
  * Execution kernel for a single program. We assume that the input data
@@ -21,35 +90,16 @@ namespace genetic {
 template <int MaxSize = MAX_STACK_SIZE>
 void execute_kernel(const program_t d_progs, const float *data, float *y_pred,
                     const uint64_t n_rows, const uint64_t n_progs) {
+  const uint64_t n_blocks = (n_rows + BLOCK_ROWS - 1) / BLOCK_ROWS;
+
+  #pragma omp parallel for collapse(2) schedule(dynamic)
   for (uint64_t pid = 0; pid < n_progs; ++pid) {
-    const program_t curr_p = d_progs + pid;
-    const node *nodes = curr_p->nodes;
-    const int len = curr_p->len;
-    float *pred = y_pred + pid * n_rows;
-    std::vector<unsigned char> arities(len);
-
-    for (int i = 0; i < len; ++i) {
-      const auto type = nodes[i].t;
-      arities[i] = detail::is_nonterminal(type) ? static_cast<unsigned char>(detail::arity(type)) : 0;
-    }
-
-    for (uint64_t row_id = 0; row_id < n_rows; ++row_id) {
-      int top = 0;
-      float eval_stack[MaxSize];
-      float in[2] = {0.0f, 0.0f};
-      for (int i = len - 1; i >= 0; --i) {
-        const unsigned char ar = arities[i];
-        if (ar != 0) {
-          in[0] = eval_stack[--top];
-          if (ar > 1) {
-            in[1] = eval_stack[--top];
-          }
-        }
-        const float res =
-            detail::evaluate_node(nodes[i], data, n_rows, row_id, in);
-        eval_stack[top++] = res;
-      }
-      pred[row_id] = eval_stack[--top];
+    for (uint64_t blk = 0; blk < n_blocks; ++blk) {
+      const uint64_t r0 = blk * BLOCK_ROWS;
+      const int nb = static_cast<int>(
+          std::min<uint64_t>(BLOCK_ROWS, n_rows - r0));
+      eval_block<MaxSize>(d_progs + pid, data, n_rows, r0, nb,
+                          y_pred + pid * n_rows + r0);
     }
   }
 }
@@ -126,12 +176,38 @@ void find_batched_fitness(int n_progs, program_t d_progs, float *score,
                           const float *data, const float *y,
                           const float *sample_weights) {
 
-  std::vector<float> y_pred((uint64_t)n_rows * (uint64_t)n_progs);
-  execute(d_progs, n_rows, n_progs, data, y_pred.data());
+  int n_threads = omp_get_max_threads();
 
-  // Compute error
-  compute_metric(n_rows, n_progs, y, y_pred.data(), sample_weights, score,
-                 params);
+  // parallelize over rows on two-pass layout
+  if (n_progs < n_threads) {
+    std::vector<float> y_pred(static_cast<uint64_t>(n_rows) * n_progs);
+    execute(d_progs, n_rows, n_progs, data, y_pred.data());
+    compute_metric(n_rows, n_progs, y, y_pred.data(), sample_weights, score,
+                   params);
+    return;
+  }
+
+  // fused path: one program per thread at a time, execute then score
+  // Memory is n_rows floats per thread instead of n_rows * n_progs
+  const uint64_t nr = static_cast<uint64_t>(n_rows);
+  const uint64_t n_blocks = (nr + BLOCK_ROWS - 1) / BLOCK_ROWS;
+
+  #pragma omp parallel
+  {
+    std::vector<float> pred(nr);
+
+    #pragma omp for schedule(dynamic)
+    for (int p = 0; p < n_progs; ++p) {
+      for (uint64_t blk = 0; blk < n_blocks; ++blk) {
+        const uint64_t r0 = blk * BLOCK_ROWS;
+        const int nb = static_cast<int>(
+            std::min<uint64_t>(BLOCK_ROWS, nr - r0));
+        eval_block(d_progs + p, data, nr, r0, nb, pred.data() + r0);
+      }
+      compute_metric(n_rows, 1, y, pred.data(), sample_weights, score + p,
+                     params);
+    }
+  }
 }
 
 void set_fitness(program &h_prog, const param &params, const int n_rows,
@@ -158,7 +234,7 @@ void set_batched_fitness(int n_progs, std::vector<program> &h_progs,
 
   // Update scores on host and device
   // TODO: Find a way to reduce the number of implicit memory transfers
-  for (auto i = 0; i < n_progs; ++i) {
+  for (int i = 0; i < n_progs; ++i) {
     h_progs[i].raw_fitness_ = score[i];
   }
 }
@@ -476,6 +552,7 @@ void hoist_mutation(const program &prog, program &p_out, const param &params,
   sub_end += prog_start;
 
   p_out.len = (prog_start) + (sub_end - sub_start) + (prog.len - prog_end);
+  delete[] p_out.nodes; // added to free memory
   p_out.nodes = new node[p_out.len];
   p_out.metric = prog.metric;
 
