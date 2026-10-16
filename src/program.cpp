@@ -43,43 +43,83 @@ template <int MaxSize = MAX_STACK_SIZE, int B = BLOCK_ROWS>
 inline void eval_block(const program_t prog, const float *data,
                        const uint64_t n_rows, const uint64_t r0, const int nb,
                        float *out) {
+  using T = node::type;
+  using detail::MIN_VAL;
   const node *nodes = prog->nodes;
   const int len = prog->len;
-  const unsigned char *arities = compute_arities(nodes, len);
 
-  float stack[MaxSize][B];  // MaxSize * B floats, about 20 KB at 20 x 256
+  alignas(64) float stack[MaxSize][B];
   int top = 0;
-  float in[2] = {0.0f, 0.0f};
+
+// a = in[0] (top of stack), b = in[1] (second), same as evaluate_node
+#define UNARY(expr)                                                  \
+  {                                                                  \
+    float *x = stack[top - 1];                                       \
+    for (int j = 0; j < nb; ++j) { const float a = x[j]; x[j] = (expr); } \
+  } break;
+#define BINARY(expr)                                                 \
+  {                                                                  \
+    const float *x0 = stack[top - 1];                                \
+    float *x1 = stack[top - 2];                                      \
+    for (int j = 0; j < nb; ++j) {                                   \
+      const float a = x0[j], b = x1[j]; x1[j] = (expr);              \
+    }                                                                \
+    --top;                                                           \
+  } break;
 
   for (int i = len - 1; i >= 0; --i) {
     const node &nd = nodes[i];
-    const unsigned char ar = arities[i];
-
-    if (ar == 0) {
-      // terminal: push a new row-vector
-      float *dst = stack[top];
-      for (int j = 0; j < nb; ++j)
-        dst[j] = detail::evaluate_node(nd, data, n_rows, r0 + j, in);
-      ++top;
-    } else if (ar == 1) {
-      // unary: overwrite top in place
-      float *x = stack[top - 1];
-      for (int j = 0; j < nb; ++j) {
-        in[0] = x[j];
-        x[j] = detail::evaluate_node(nd, data, n_rows, r0 + j, in);
-      }
-    } else {
-      // binary: in[0] = top, in[1] = second; result replaces second
-      float *a0 = stack[top - 1];
-      float *a1 = stack[top - 2];
-      for (int j = 0; j < nb; ++j) {
-        in[0] = a0[j];
-        in[1] = a1[j];
-        a1[j] = detail::evaluate_node(nd, data, n_rows, r0 + j, in);
-      }
-      --top;
+    switch (nd.t) {
+    case T::constant: {
+      float *d = stack[top++];
+      const float v = nd.u.val;
+      for (int j = 0; j < nb; ++j) d[j] = v;
+    } break;
+    case T::variable: {
+      const float *col = data + n_rows * nd.u.fid + r0;  // contiguous column
+      std::copy(col, col + nb, stack[top++]);
+    } break;
+    // binary
+    case T::add:   BINARY(a + b)
+    case T::atan2: BINARY(atan2f(a, b))
+    case T::div:   BINARY(fabsf(b) < MIN_VAL ? 1.0f : a / b)
+    case T::fdim:  BINARY(fdimf(a, b))
+    case T::gt:    BINARY(a > b ? 1.0f : 0.0f)
+    case T::max:   BINARY(fmaxf(a, b))
+    case T::min:   BINARY(fminf(a, b))
+    case T::mul:   BINARY(a * b)
+    case T::pow:   BINARY(powf(a, b))
+    case T::sub:   BINARY(a - b)
+    // unary
+    case T::abs:   UNARY(fabsf(a))
+    case T::acos:  UNARY(acosf(a))
+    case T::acosh: UNARY(acoshf(a))
+    case T::asin:  UNARY(asinf(a))
+    case T::asinh: UNARY(asinhf(a))
+    case T::atan:  UNARY(atanf(a))
+    case T::atanh: UNARY(atanhf(a))
+    case T::cbrt:  UNARY(cbrtf(a))
+    case T::cos:   UNARY(cosf(a))
+    case T::cosh:  UNARY(coshf(a))
+    case T::cube:  UNARY(a * a * a)
+    case T::exp:   UNARY(expf(a))
+    case T::inv:   UNARY(fabsf(a) < MIN_VAL ? 0.f : 1.f / a)
+    case T::log:   UNARY(fabsf(a) < MIN_VAL ? 0.f : logf(fabsf(a)))
+    case T::neg:   UNARY(-a)
+    case T::rcbrt: UNARY(1.0f / cbrtf(a))
+    case T::rsqrt: UNARY(1.0f / sqrtf(fabsf(a)))
+    case T::sin:   UNARY(sinf(a))
+    case T::sinh:  UNARY(sinhf(a))
+    case T::sq:    UNARY(a * a)
+    case T::sqrt:  UNARY(sqrtf(fabsf(a)))
+    case T::tan:   UNARY(tanf(a))
+    case T::tanh:  UNARY(tanhf(a))
+    default: break;
     }
   }
+#undef UNARY
+#undef BINARY
+
   std::copy(stack[0], stack[0] + nb, out);
 }
 
